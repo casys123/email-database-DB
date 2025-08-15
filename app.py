@@ -265,4 +265,158 @@ with tab_search:
             queries.append(f'General Contractors "{location}" site:.com OR site:.net OR site:.org "{radius_phrase}"')
         if "Builders" in categories:
             queries.append(f'Home Builders "{location}" site:.com OR site:.net OR site:.org "{radius_phrase}"')
-        if "Archite
+        if "Architects" in categories:
+            queries.append(f'Architecture Firms "{location}" site:.com OR site:.net OR site:.org "{radius_phrase}"')
+
+        per_q = max(10, max_sites // max(len(queries), 1))
+        all_urls = []
+
+        for q in queries:
+            if provider.startswith("Bing API"):
+                urls = search_bing_api(q, key=st.secrets.get("BING_API_KEY", "") or BING_API_KEY, count=per_q)
+            else:
+                urls = search_serp_api(
+                    q, base_url=SERP_BASE_URL, key=SERP_KEY, method=SERP_METHOD,
+                    auth_header=(SERP_AUTH_HEADER or None),
+                    key_param=(SERP_KEY_PARAM or None),
+                    count=per_q
+                )
+            all_urls += urls
+            time.sleep(rate_delay or 1.0)
+
+        # Deduplicate by domain, keep first
+        by_domain = {}
+        for u in all_urls:
+            d = domain_of(u) or u
+            if d not in by_domain:
+                by_domain[d] = u
+
+        urls = list(by_domain.values())[:max_sites]
+        st.write(f"Unique candidate sites: **{len(urls)}**")
+
+        added = 0
+        for base in urls:
+            # Try contact/about first (fallback to homepage)
+            for path in ["", "/contact", "/contact-us", "/about", "/team"]:
+                target = base.rstrip("/") + path
+                name, email, phone = extract_company_info(
+                    target,
+                    unlocker_base=UNLOCKER_BASE if UNLOCKER_BASE and UNLOCKER_KEY else "",
+                    unlocker_key=UNLOCKER_KEY,
+                    key_header=(UNLOCKER_AUTH_HEADER or None),
+                    key_param=(UNLOCKER_KEY_PARAM or None),
+                )
+                if email:
+                    upsert_lead(name, email, base, phone, source=("serp+unlocker" if UNLOCKER_BASE and UNLOCKER_KEY else "serp"))
+                    added += 1
+                    break
+                time.sleep(rate_delay or 1.0)
+
+        st.success(f"Added {added} contacts. Check **Results** tab.")
+
+with tab_results:
+    st.subheader("Leads")
+    df = st.session_state.leads.copy()
+    if df.empty:
+        st.info("No leads yet. Run a search first.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(f"Total leads: {len(df)}")
+
+with tab_email:
+    st.subheader("Email campaign (SendGrid)")
+    st.caption("Sender: info@miamimasterflooring.com (fixed). Set SENDGRID_API_KEY in Secrets to enable sending.")
+    colA, colB = st.columns(2)
+    with colA:
+        subject = st.text_input("Subject", "Flooring Installations for Your Upcoming Projects")
+        greeting = st.text_input("Greeting", "Dear Team,")
+        body = st.text_area(
+            "Body (HTML allowed)",
+            value=(
+                "<p>We specialize in high-quality flooring installations for commercial and residential projects in your area.</p>"
+                "<ul><li>Luxury vinyl plank (LVP)</li><li>Waterproof flooring</li>"
+                "<li>Custom tile & stone</li><li>10-year craftsmanship warranty</li></ul>"
+                "<p>Could we schedule a brief call next week?</p>"
+            ),
+            height=180,
+        )
+    with colB:
+        signature = st.text_area(
+            "Signature (HTML allowed)",
+            value=(
+                f"<p>Best regards,<br>Miami Master Flooring<br>{SENDER_EMAIL}<br>(305) 000-0000<br>"
+                "<a href='https://www.miamimasterflooring.com' target='_blank'>www.miamimasterflooring.com</a></p>"
+                "<p style='font-size:12px;color:#666'>If you prefer not to receive these emails, reply with 'unsubscribe'.</p>"
+            ),
+            height=180,
+        )
+        daily_cap = st.number_input("Daily send cap", min_value=10, max_value=500, value=100, step=10)
+
+    emails = st.session_state.leads["Email"].dropna().tolist() if not st.session_state.leads.empty else []
+    preview = st.selectbox("Preview recipient", options=(emails[:50] or ["no-data"]))
+
+    def render_html(greeting, body, signature):
+        return f"{greeting}<br/>{body}{signature}"
+
+    c1, c2 = st.columns(2)
+    if c1.button("Send test to preview"):
+        if not SENDGRID_API_KEY:
+            st.error("SENDGRID_API_KEY not set in Secrets.")
+        elif preview and preview != "no-data":
+            try:
+                code = send_email_sendgrid(preview, subject, render_html(greeting, body, signature))
+                st.success(f"Sent to {preview} (HTTP {code})")
+            except Exception as e:
+                st.error(f"Send failed: {e}")
+
+    if c2.button("Send campaign now (up to cap)"):
+        if not SENDGRID_API_KEY:
+            st.error("SENDGRID_API_KEY not set in Secrets.")
+        else:
+            sent = 0
+            for e in emails:
+                if sent >= daily_cap:
+                    break
+                try:
+                    send_email_sendgrid(e, subject, render_html(greeting, body, signature))
+                    sent += 1
+                    time.sleep(0.3)
+                except Exception:
+                    continue
+            st.success(f"Sent {sent} emails.")
+
+with tab_export:
+    st.subheader("Export / Import")
+    df = st.session_state.leads.copy()
+    colX, colY = st.columns(2)
+    with colX:
+        if not df.empty:
+            st.download_button(
+                "Download leads.csv", data=df.to_csv(index=False),
+                file_name="leads.csv", mime="text/csv"
+            )
+    with colY:
+        up = st.file_uploader("Import leads.csv", type=["csv"])
+        if up is not None:
+            try:
+                new = pd.read_csv(up)
+                rename = {c: c.strip().title() for c in new.columns}
+                new.rename(columns=rename, inplace=True)
+                existing = set(st.session_state.leads["Email"].str.lower())
+                imported = 0
+                for _, row in new.iterrows():
+                    email = str(row.get("Email","") or "").strip()
+                    if not email or not EMAIL_RE.match(email): continue
+                    if email.lower() in existing: continue
+                    st.session_state.leads.loc[len(st.session_state.leads)] = {
+                        "Company": str(row.get("Company","") or "")[:120],
+                        "Email": email,
+                        "Website": str(row.get("Website","") or ""),
+                        "Phone": str(row.get("Phone","") or ""),
+                        "Source": "import",
+                    }
+                    existing.add(email.lower())
+                    imported += 1
+                st.success(f"Imported {imported} leads.")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
