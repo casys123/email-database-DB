@@ -1,5 +1,5 @@
-streamlit
-requests
-beautifulsoup4
-pandas
-tldextract
+streamlit==1.38.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+pandas==2.2.2
+sendgrid==6.11.0
