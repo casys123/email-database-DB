@@ -1,6 +1,5 @@
 import re
 import time
-import json
 import random
 from urllib.parse import urlparse
 from typing import Optional, Tuple, List
@@ -12,23 +11,20 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- Optional email dependency (won't crash if missing) ---
-try:
-    from sendgrid import SendGridAPIClient
-    from sendgrid.helpers.mail import Mail
-    SENDGRID_AVAILABLE = True
-except Exception:
-    SENDGRID_AVAILABLE = False
+# ------------- Gmail SMTP (no SendGrid) -------------
+import smtplib, ssl
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+SENDER_NAME = st.secrets.get("SENDER_NAME", "Miami Master Flooring")
+SENDER_EMAIL = "info@miamimasterflooring.com"  # fixed
+REPLY_TO     = st.secrets.get("REPLY_TO", "info@miamimasterflooring.com")
+GMAIL_USER   = st.secrets.get("GMAIL_USER", SENDER_EMAIL)  # can override, defaults to fixed sender
+GMAIL_APP_PASSWORD = st.secrets.get("GMAIL_APP_PASSWORD", "")
 
 # ---------------------- App setup ----------------------
 st.set_page_config(page_title="Prospector + SERP/Unlocker", layout="wide")
-st.title("Local Prospector — GC / Builders / Architects (API‑ready)")
-
-# Sender identity (fixed as requested)
-SENDER_NAME = st.secrets.get("SENDER_NAME", "Miami Master Flooring")
-SENDER_EMAIL = "info@miamimasterflooring.com"
-REPLY_TO = st.secrets.get("REPLY_TO", "info@miamimasterflooring.com")
-SENDGRID_API_KEY = st.secrets.get("SENDGRID_API_KEY", "")
+st.title("Local Prospector — GC / Builders / Architects (Gmail SMTP)")
 
 EMAIL_RE  = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_RE  = re.compile(r"(?:\+1[\s\-.]?)?(?:\(?\d{3}\)?[\s\-.]?)\d{3}[\s\-.]?\d{4}")
@@ -36,7 +32,7 @@ SOCIAL_DOMAINS = (
     "facebook.com","instagram.com","linkedin.com","twitter.com","x.com",
     "youtube.com","yelp.com","angieslist.com","houzz.com","pinterest.com","tiktok.com"
 )
-EXCLUDE_DOMAINS = ("google.com", "maps.google.com", "duckduckgo.com", "bing.com")
+EXCLUDE_DOMAINS = ("google.com","maps.google.com","duckduckgo.com","bing.com")
 
 if "leads" not in st.session_state:
     st.session_state.leads = pd.DataFrame(columns=["Company","Email","Website","Phone","Source"]) 
@@ -45,24 +41,22 @@ if "leads" not in st.session_state:
 @st.cache_resource(show_spinner=False)
 def _session_with_retries():
     s = requests.Session()
-    r = Retry(
-        total=6, connect=3, read=3, status=3,
-        backoff_factor=0.7,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET","POST"]),
-        raise_on_status=False,
-    )
+    r = Retry(total=6, connect=3, read=3, status=3,
+              backoff_factor=0.7,
+              status_forcelist=(429,500,502,503,504),
+              allowed_methods=frozenset(["GET","POST"]),
+              raise_on_status=False)
     s.mount("http://", HTTPAdapter(max_retries=r))
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
         "User-Agent": random.choice([
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/123 Safari/537.36"
         ]),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
+        "Connection": "keep-alive"
     })
     return s
 
@@ -70,13 +64,10 @@ HTTP = _session_with_retries()
 
 # ---------------------- Helpers ----------------------
 def domain_of(u: str) -> str:
-    try:
-        return urlparse(u).netloc.lower()
-    except Exception:
-        return ""
+    try: return urlparse(u).netloc.lower()
+    except Exception: return ""
 
-# Email helpers
-GENERIC_PREFIXES = {"info", "contact", "sales", "hello", "admin", "support", "office", "team"}
+GENERIC_PREFIXES = {"info","contact","sales","hello","admin","support","office","team"}
 
 def is_generic_email(email: str) -> bool:
     try:
@@ -85,36 +76,29 @@ def is_generic_email(email: str) -> bool:
     except Exception:
         return False
 
-# Optional MX check (requires dnspython)
 @st.cache_data(show_spinner=False)
 def verify_email_mx(email: str) -> bool:
-    """Return True if domain has MX records. If dnspython missing or lookup fails, be permissive (True)."""
+    """DNS-over-HTTPS MX check via Google DNS; permissive on failure."""
     try:
-        import dns.resolver  # type: ignore
-        domain = email.split("@", 1)[1]
-        answers = dns.resolver.resolve(domain, 'MX', lifetime=3.0)
-        return len(answers) > 0
+        d = email.split("@",1)[1]
+        r = HTTP.get(f"https://dns.google/resolve?name={d}&type=MX", timeout=5)
+        return r.ok and "Answer" in r.json()
     except Exception:
-        # If we can't verify, don't block
         return True
 
 
 def looks_like_business_site(u: str) -> bool:
     d = domain_of(u)
-    if not d:
-        return False
-    if any(s in d for s in SOCIAL_DOMAINS):
-        return False
-    if any(d.endswith(tld) for tld in (".com", ".net", ".org", ".io", ".co")) and not any(d.endswith(x) or d == x for x in EXCLUDE_DOMAINS):
+    if not d: return False
+    if any(s in d for s in SOCIAL_DOMAINS): return False
+    if any(d.endswith(tld) for tld in (".com",".net",".org",".io",".co")) and not any(d.endswith(x) or d==x for x in EXCLUDE_DOMAINS):
         return True
     return False
 
 # ---------------------- Providers ----------------------
-# 1) Bing Web Search API (official)
 @st.cache_data(show_spinner=False, ttl=3600)
 def search_bing_api(query: str, key: str, count: int = 20) -> List[str]:
-    if not key:
-        return []
+    if not key: return []
     try:
         endpoint = "https://api.bing.microsoft.com/v7.0/search"
         headers = {"Ocp-Apim-Subscription-Key": key}
@@ -127,84 +111,65 @@ def search_bing_api(query: str, key: str, count: int = 20) -> List[str]:
     except Exception:
         return []
 
-# 2) Generic SERP API (any JSON shape w/ urls)
 @st.cache_data(show_spinner=False, ttl=3600)
 def search_serp_api(query: str, base_url: str, key: str, method: str = "GET",
                     auth_header: Optional[str] = "X-API-KEY", key_param: Optional[str] = None,
                     count: int = 20) -> List[str]:
-    if not base_url or not key:
-        return []
+    if not base_url or not key: return []
     try:
         headers = {"User-Agent": HTTP.headers.get("User-Agent")}
-        if auth_header:
-            headers[auth_header] = key
+        if auth_header: headers[auth_header] = key
         params = {"q": query, "count": count}
-        if key_param:
-            params[key_param] = key
-        if method.upper() == "POST":
-            r = HTTP.post(base_url, headers=headers, json=params, timeout=25)
-        else:
-            r = HTTP.get(base_url, headers=headers, params=params, timeout=25)
+        if key_param: params[key_param] = key
+        r = HTTP.post(base_url, headers=headers, json=params, timeout=25) if method.upper()=="POST" else HTTP.get(base_url, headers=headers, params=params, timeout=25)
         r.raise_for_status()
-        data = r.json()
-        urls: List[str] = []
+        data = r.json(); urls: List[str] = []
         if isinstance(data, dict):
             if "webPages" in data and isinstance(data["webPages"], dict) and "value" in data["webPages"]:
                 urls = [v.get("url") for v in data["webPages"]["value"] if v.get("url")]
             elif "results" in data and isinstance(data["results"], list):
                 for item in data["results"]:
-                    u = item.get("url") or item.get("link")
-                    if u:
-                        urls.append(u)
+                    u = (item.get("url") or item.get("link"))
+                    if u: urls.append(u)
         elif isinstance(data, list):
             for item in data:
-                if isinstance(item, str):
-                    urls.append(item)
+                if isinstance(item, str): urls.append(item)
                 elif isinstance(item, dict):
-                    u = item.get("url") or item.get("link")
-                    if u:
-                        urls.append(u)
-        urls = [u for u in urls if u and looks_like_business_site(u)]
-        return urls[:count]
+                    u = (item.get("url") or item.get("link"))
+                    if u: urls.append(u)
+        return [u for u in urls if u and looks_like_business_site(u)][:count]
     except Exception:
         return []
 
-# 3) Unlocker for page fetch
 @st.cache_data(show_spinner=False, ttl=3600)
 def unlocker_fetch(url: str, unlocker_base: str, key: str,
                    key_header: Optional[str] = "X-API-KEY", key_param: Optional[str] = None) -> Optional[str]:
     try:
         headers = {"User-Agent": HTTP.headers.get("User-Agent")}
-        if key_header:
-            headers[key_header] = key
+        if key_header: headers[key_header] = key
         params = {"url": url}
-        if key_param:
-            params[key_param] = key
+        if key_param: params[key_param] = key
         r = HTTP.get(unlocker_base, headers=headers, params=params, timeout=30)
         r.raise_for_status()
         if r.headers.get("Content-Type", "").startswith("application/json"):
-            j = r.json()
-            return j.get("html")
+            j = r.json(); return j.get("html")
         return r.text
     except Exception:
         return None
 
 # ---------------------- Extraction ----------------------
 def extract_company_info_from_html(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    if not html:
-        return None, None, None
+    if not html: return None, None, None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
     emails = EMAIL_RE.findall(text)
     phones = PHONE_RE.findall(text)
     company = None
     title = (soup.title.string if soup.title and soup.title.string else "").strip()
-    if title:
-        company = title.split(" | ")[0].split(" – ")[0].split(" - ")[0].strip()[:120]
+    if title: company = title.split(" | ")[0].split(" – ")[0].split(" - ")[0].strip()[:120]
     if not company:
         h1 = soup.find("h1")
-        if h1 and h1.get_text(strip=True):
-            company = h1.get_text(strip=True)[:120]
+        if h1 and h1.get_text(strip=True): company = h1.get_text(strip=True)[:120]
     return company, (emails[0] if emails else None), (phones[0] if phones else None)
 
 
@@ -215,76 +180,60 @@ def extract_company_info(url: str, unlocker_base: str = "", unlocker_key: str = 
         html = unlocker_fetch(url, unlocker_base, unlocker_key, key_header=key_header, key_param=key_param)
     if not html:
         try:
-            r = HTTP.get(url, timeout=15)
-            r.raise_for_status()
-            html = r.text
+            r = HTTP.get(url, timeout=15); r.raise_for_status(); html = r.text
         except Exception:
             return None, None, None
     return extract_company_info_from_html(html)
 
-# ---------------------- Lead insert with filters ----------------------
-# Quality / verification toggles live in session state for global access
-st.session_state.setdefault('skip_generic', False)
-st.session_state.setdefault('verify_mx', False)
+# ---------------------- Lead insert + filters ----------------------
+st.session_state.setdefault('skip_generic', True)
+st.session_state.setdefault('verify_mx', True)
 
 def upsert_lead(name, email, website, phone, source):
-    if not email:
-        return
-    # Apply user-selected filters
-    if st.session_state.get('skip_generic') and is_generic_email(email):
-        return
-    if st.session_state.get('verify_mx') and not verify_email_mx(email):
-        return
+    if not email: return
+    if st.session_state.get('skip_generic') and is_generic_email(email): return
+    if st.session_state.get('verify_mx') and not verify_email_mx(email): return
     df = st.session_state.leads
     lowers = set(df["Email"].dropna().str.lower())
-    if email.lower() in lowers:
-        return
+    if email.lower() in lowers: return
     st.session_state.leads.loc[len(df)] = {
         "Company": name or "", "Email": email.strip(), "Website": website,
         "Phone": phone or "", "Source": source
     }
 
-# ---------------------- Email sending ----------------------
-def send_email_sendgrid(to_email: str, subject: str, html: str) -> int:
-    if not SENDGRID_AVAILABLE:
-        raise RuntimeError("sendgrid package not installed. Remove email sending or install sendgrid.")
-    if not SENDGRID_API_KEY:
-        raise RuntimeError("SENDGRID_API_KEY not set in Secrets.")
-    msg = Mail(
-        from_email=(SENDER_EMAIL, SENDER_NAME),
-        to_emails=[to_email],
-        subject=subject,
-        html_content=html,
-    )
-    msg.reply_to = REPLY_TO
-    sg = SendGridAPIClient(SENDGRID_API_KEY)
-    resp = sg.send(msg)
-    return resp.status_code
+# ---------------------- Gmail sending ----------------------
+def send_email_gmail(to_email: str, subject: str, html: str) -> int:
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD in Streamlit Secrets.")
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"{SENDER_NAME} <{GMAIL_USER}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg["Reply-To"] = REPLY_TO
+    part = MIMEText(html, "html"); msg.attach(part)
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        failures = server.sendmail(GMAIL_USER, [to_email], msg.as_string())
+        if failures: raise RuntimeError(f"Failed for: {failures}")
+    return 250
 
-# ---------------------- UI ----------------------
+# ---------------------- Sidebar ----------------------
 with st.sidebar:
     st.subheader("Provider Settings")
-    provider = st.selectbox(
-        "Search provider",
-        ["Bing API (recommended)", "Generic SERP API"],
-        index=0
-    )
+    provider = st.selectbox("Search provider", ["Bing API (recommended)", "Generic SERP API"], index=0)
     if provider == "Bing API (recommended)":
         BING_API_KEY = st.secrets.get("BING_API_KEY", "")
         if not BING_API_KEY:
             BING_API_KEY = st.text_input("BING_API_KEY (or add to Secrets)", type="password")
-        SERP_BASE_URL = ""
-        SERP_KEY = ""
-        SERP_METHOD = "GET"
-        SERP_AUTH_HEADER = "X-API-KEY"
-        SERP_KEY_PARAM = ""
+        SERP_BASE_URL = ""; SERP_KEY = ""; SERP_METHOD = "GET"; SERP_AUTH_HEADER = "X-API-KEY"; SERP_KEY_PARAM = ""
     else:
         SERP_BASE_URL = st.text_input("SERP Base URL (endpoint that returns JSON)")
         SERP_KEY = st.secrets.get("SERP_API_KEY", "")
         if not SERP_KEY:
             SERP_KEY = st.text_input("SERP API Key (or add to Secrets)", type="password")
         SERP_METHOD = st.selectbox("SERP HTTP Method", ["GET","POST"], index=0)
-        SERP_AUTH_HEADER = st.text_input("Auth Header (blank if using query param)", value="X-API-KEY")
+        SERP_AUTH_HEADER = st.text_input("Auth Header (blank if query param)", value="X-API-KEY")
         SERP_KEY_PARAM = st.text_input("Key Query Param (e.g., api_key)", value="")
 
     st.markdown("---")
@@ -298,16 +247,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Quality filters")
-    st.session_state['skip_generic'] = st.checkbox("Skip generic inboxes (info@, sales@, admin@)", value=st.session_state.get('skip_generic', False))
-    st.session_state['verify_mx'] = st.checkbox("Verify email domains via MX lookup (requires dnspython)", value=st.session_state.get('verify_mx', False))
+    st.session_state['skip_generic'] = st.checkbox("Skip generic inboxes (info@, sales@, admin@)", value=st.session_state.get('skip_generic', True))
+    st.session_state['verify_mx'] = st.checkbox("Verify email domains via MX lookup", value=st.session_state.get('verify_mx', True))
 
-
-# Tabs
+# ---------------------- Tabs ----------------------
 tab_search, tab_results, tab_email, tab_export = st.tabs(["Search", "Results", "Email", "Export/Import"]) 
 
 with tab_search:
     st.subheader("Find GC / Builders / Architects near you")
-    # Area presets
     presets = {
         "Miami-Dade County": "Miami-Dade County, FL",
         "Broward County": "Broward County, FL",
@@ -315,7 +262,6 @@ with tab_search:
         "Custom": None,
     }
     preset_choice = st.selectbox("Quick area preset", list(presets.keys()), index=0)
-
     col1, col2 = st.columns(2)
     with col1:
         if preset_choice != "Custom":
@@ -333,7 +279,6 @@ with tab_search:
 
     if st.button("Search & Extract"):
         try:
-            # Build gentle queries (no "email" keyword)
             queries: List[str] = []
             if "General Contractors" in categories:
                 queries.append(f'General Contractors "{location}" {radius_phrase} (site:.com OR site:.net OR site:.org)')
@@ -344,28 +289,22 @@ with tab_search:
 
             per_q = max(10, max_sites // max(len(queries), 1))
             all_urls: List[str] = []
-
             progress = st.progress(0)
             for i, q in enumerate(queries):
                 if provider.startswith("Bing API"):
                     key = st.secrets.get("BING_API_KEY", "") or BING_API_KEY
                     urls = search_bing_api(q, key=key, count=per_q)
                 else:
-                    urls = search_serp_api(
-                        q, base_url=SERP_BASE_URL, key=SERP_KEY, method=SERP_METHOD,
-                        auth_header=(SERP_AUTH_HEADER or None),
-                        key_param=(SERP_KEY_PARAM or None),
-                        count=per_q
-                    )
+                    urls = search_serp_api(q, base_url=SERRP_BASE_URL if 'SERRP_BASE_URL' in globals() else SERP_BASE_URL, key=SERP_KEY, method=SERP_METHOD,
+                                           auth_header=(SERP_AUTH_HEADER or None), key_param=(SERP_KEY_PARAM or None), count=per_q)
                 all_urls += urls
                 progress.progress(int(((i+1)/max(len(queries),1))*100))
                 time.sleep(rate_delay or 1.0)
 
-            # Deduplicate by domain, keep first
             by_domain = {}
             for u in all_urls:
                 d = domain_of(u) or u
-                if d not in by_domain and not any(d.endswith(x) or d == x for x in EXCLUDE_DOMAINS):
+                if d not in by_domain and not any(d.endswith(x) or d==x for x in EXCLUDE_DOMAINS):
                     by_domain[d] = u
 
             urls = list(by_domain.values())[:max_sites]
@@ -373,7 +312,6 @@ with tab_search:
 
             added = 0
             for j, base in enumerate(urls, start=1):
-                # Try contact/about first (fallback to homepage)
                 for path in ["", "/contact", "/contact-us", "/about", "/team"]:
                     target = base.rstrip("/") + path
                     name, email, phone = extract_company_info(
@@ -404,10 +342,8 @@ with tab_results:
         st.caption(f"Total leads: {len(df)}")
 
 with tab_email:
-    st.subheader("Email campaign (SendGrid)")
-    st.caption("Sender: info@miamimasterflooring.com (fixed). Set SENDGRID_API_KEY in Secrets to enable sending. Tip: Enable MX verification in sidebar to reduce bounces.")
-    if not SENDGRID_AVAILABLE:
-        st.warning("SendGrid not installed. Run `pip install sendgrid` or skip sending.")
+    st.subheader("Email campaign (Gmail)")
+    st.caption("Sender: info@miamimasterflooring.com via Gmail SMTP. Set GMAIL_APP_PASSWORD in Secrets. Use App Passwords (Google Account → Security → 2‑Step Verification → App passwords).")
     colA, colB = st.columns(2)
     with colA:
         subject = st.text_input("Subject", "Flooring Installations for Your Upcoming Projects")
@@ -441,35 +377,35 @@ with tab_email:
         return f"{greeting}<br/>{body}{signature}"
 
     c1, c2 = st.columns(2)
-    if c1.button("Send test to preview"):
-        if not SENDGRID_AVAILABLE:
-            st.error("SendGrid not installed.")
-        elif not SENDGRID_API_KEY:
-            st.error("SENDGRID_API_KEY not set in Secrets.")
+    if c1.button("Send test to preview (Gmail)"):
+        if not GMAIL_APP_PASSWORD:
+            st.error("GMAIL_APP_PASSWORD not set in Secrets.")
         elif preview and preview != "no-data":
             try:
-                code = send_email_sendgrid(preview, subject, render_html(greeting, body, signature))
-                st.success(f"Sent to {preview} (HTTP {code})")
+                code = send_email_gmail(preview, subject, render_html(greeting, body, signature))
+                st.success(f"Sent to {preview} (code {code})")
             except Exception as e:
                 st.error(f"Send failed: {e}")
 
-    if c2.button("Send campaign now (up to cap)"):
-        if not SENDGRID_AVAILABLE:
-            st.error("SendGrid not installed.")
-        elif not SENDGRID_API_KEY:
-            st.error("SENDGRID_API_KEY not set in Secrets.")
+    if c2.button("Send campaign now (up to cap) — Gmail"):
+        if not GMAIL_APP_PASSWORD:
+            st.error("GMAIL_APP_PASSWORD not set in Secrets.")
         else:
             sent = 0
             for e in emails:
                 if sent >= daily_cap:
                     break
+                if st.session_state.get('skip_generic') and is_generic_email(e):
+                    continue
+                if st.session_state.get('verify_mx') and not verify_email_mx(e):
+                    continue
                 try:
-                    send_email_sendgrid(e, subject, render_html(greeting, body, signature))
+                    send_email_gmail(e, subject, render_html(greeting, body, signature))
                     sent += 1
                     time.sleep(0.3)
                 except Exception:
                     continue
-            st.success(f"Sent {sent} emails.")
+            st.success(f"Sent {sent} emails via Gmail.")
 
 with tab_export:
     st.subheader("Export / Import")
