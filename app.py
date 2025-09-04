@@ -29,9 +29,7 @@ GMAIL_USER = st.secrets.get("GMAIL_USER", SENDER_EMAIL)  # SMTP login user (can 
 GMAIL_APP_PASSWORD = st.secrets.get("GMAIL_APP_PASSWORD", "")  # Google App Password
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-PHONE_RE = re.compile(
-    r"(?:\+1[\s\-.]?)?(?:\(?\d{3}\)?[\s\-.]?)\d{3}[\s\-.]?\d{4}"
-)
+PHONE_RE = re.compile(r"(?:\+1[\s\-.]?)?(?:\(?\d{3}\)?[\s\-.]?)\d{3}[\s\-.]?\d{4}")
 SOCIAL_AGG_DOMAINS = (
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
     "youtube.com", "yelp.com", "angieslist.com", "houzz.com", "pinterest.com",
@@ -41,7 +39,6 @@ EXCLUDE_DOMAINS = (
     "google.com", "maps.google.com", "duckduckgo.com", "bing.com",
     "support.google.com", "developers.google.com", "webcache.googleusercontent.com",
 )
-
 GENERIC_PREFIXES = {"info", "contact", "sales", "hello", "admin", "support", "office", "team"}
 
 # Session-state DF
@@ -79,7 +76,6 @@ HTTP = _session_with_retries()
 def domain_of(u: str) -> str:
     try:
         d = urlparse(u).netloc.lower()
-        # Normalize common www/locale subdomains for dedupe
         return d[4:] if d.startswith("www.") else d
     except Exception:
         return ""
@@ -115,6 +111,12 @@ def verify_email_mx(email: str) -> bool:
         return bool(j.get("Answer"))
     except Exception:
         return True
+
+def _first_non_empty(*vals):
+    for v in vals:
+        if v:
+            return v
+    return None
 
 # ---------------------- Search providers ----------------------
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -209,12 +211,6 @@ def unlocker_fetch(
         return None
 
 # ---------------------- Extraction ----------------------
-def _first_non_empty(*vals):
-    for v in vals:
-        if v:
-            return v
-    return None
-
 def extract_company_info_from_html(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     if not html:
         return None, None, None
@@ -362,6 +358,7 @@ with st.sidebar:
 # ---------------------- Tabs ----------------------
 tab_search, tab_results, tab_email, tab_export = st.tabs(["Search", "Results", "Email", "Export/Import"])
 
+# ====================== SEARCH TAB ======================
 with tab_search:
     st.subheader("Find GC / Builders / Architects near you")
     presets = {
@@ -411,7 +408,6 @@ with tab_search:
                     key = st.secrets.get("BING_API_KEY", "") or BING_API_KEY
                     urls = search_bing_api(q, key=key, count=per_q)
                 else:
-                    # FIXED: variable name (was SERRP_BASE_URL)
                     urls = search_serp_api(
                         q,
                         base_url=SERP_BASE_URL,
@@ -460,15 +456,223 @@ with tab_search:
         except Exception as e:
             st.exception(e)
 
+# ====================== RESULTS TAB ======================
 with tab_results:
     st.subheader("Leads")
+
+    # ---------- Manual add (single) ----------
+    st.markdown("### Add a lead (single)")
+    with st.form("add_single_lead", clear_on_submit=True):
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            company_in = st.text_input("Company", "")
+            website_in = st.text_input("Website (https://...)", "")
+        with c2:
+            email_in = st.text_input("Email", "")
+            phone_in = st.text_input("Phone", "")
+
+        source_in = st.text_input("Source (optional)", "manual")
+        submitted_single = st.form_submit_button("Add lead")
+
+    if submitted_single:
+        email = (email_in or "").strip()
+        company = (company_in or "").strip()[:120]
+        website = (website_in or "").strip()
+        phone = (phone_in or "").strip()
+
+        if not email or not EMAIL_RE.match(email):
+            st.error("Please provide a valid email.")
+        elif st.session_state.get("skip_generic") and is_generic_email(email):
+            st.warning("Skipped: generic inbox (info@ / sales@ / admin@). Uncheck the filter in the sidebar to allow.")
+        elif st.session_state.get("verify_mx") and not verify_email_mx(email):
+            st.warning("Skipped: email domain appears to have no MX record. Uncheck the MX filter in the sidebar to allow.")
+        else:
+            lowers = set(st.session_state.leads["Email"].dropna().str.lower())
+            if email.lower() in lowers:
+                st.info("Duplicate email — this lead already exists.")
+            else:
+                upsert_lead(company, email, website, phone, source_in or "manual")
+                st.success(f"Added: {company or '(no company)'} — {email}")
+
+    st.markdown("---")
+
+    # ---------- Manual add (bulk paste) ----------
+    st.markdown("### Bulk paste (CSV/TSV — one lead per line)")
+    st.caption("Accepted columns in any order: Company, Email, Website, Phone, Source. First line may be a header.")
+
+    example = "Company,Email,Website,Phone,Source\nAcme Builders,contact@acmebuilders.com,https://acmebuilders.com,(305) 123-4567,manual"
+    bulk_text = st.text_area("Paste rows here", value=example, height=150)
+
+    cA, cB = st.columns([1, 3])
+    with cA:
+        delimiter = st.radio("Delimiter", options=[",", "\t", "|", ";"], index=0)
+    with cB:
+        do_header = st.checkbox("First row is a header", value=True)
+
+    if st.button("Add pasted leads"):
+        raw = (bulk_text or "").strip()
+        if not raw:
+            st.error("Nothing to import.")
+        else:
+            rows = [r for r in raw.splitlines() if r.strip()]
+            if do_header and rows:
+                rows = rows[1:]  # drop header row
+
+            added = 0
+            skipped_invalid = 0
+            skipped_generic = 0
+            skipped_mx = 0
+            skipped_dup = 0
+
+            existing = set(st.session_state.leads["Email"].dropna().str.lower())
+            delim = "\t" if delimiter == "\t" else delimiter
+
+            header_map = {}
+            if do_header and bulk_text:
+                hdr_line = bulk_text.splitlines()[0]
+                hdr_cols = [h.strip().lower() for h in hdr_line.split(delim)]
+                for idx, name in enumerate(hdr_cols):
+                    header_map[name] = idx
+
+            def get_col(cols, name, default_idx):
+                if header_map and name in header_map and header_map[name] < len(cols):
+                    return cols[header_map[name]].strip()
+                if default_idx < len(cols):
+                    return cols[default_idx].strip()
+                return ""
+
+            for line in rows:
+                cols = [c.strip() for c in line.split(delim)]
+                company = get_col(cols, "company", 0)[:120]
+                email = get_col(cols, "email", 1)
+                website = get_col(cols, "website", 2)
+                phone = get_col(cols, "phone", 3)
+                source = get_col(cols, "source", 4) or "manual"
+
+                if not email or not EMAIL_RE.match(email):
+                    skipped_invalid += 1
+                    continue
+                if st.session_state.get("skip_generic") and is_generic_email(email):
+                    skipped_generic += 1
+                    continue
+                if st.session_state.get("verify_mx") and not verify_email_mx(email):
+                    skipped_mx += 1
+                    continue
+                if email.lower() in existing:
+                    skipped_dup += 1
+                    continue
+
+                upsert_lead(company, email, website, phone, source)
+                existing.add(email.lower())
+                added += 1
+
+            st.success(f"Imported {added} lead(s).")
+            if skipped_invalid:
+                st.info(f"Skipped {skipped_invalid} invalid email(s).")
+            if skipped_generic:
+                st.info(f"Skipped {skipped_generic} generic inbox(es). (See sidebar filter)")
+            if skipped_mx:
+                st.info(f"Skipped {skipped_mx} email(s) without MX. (See sidebar filter)")
+            if skipped_dup:
+                st.info(f"Skipped {skipped_dup} duplicate email(s).")
+
+    st.markdown("---")
+
+    # ---------- Editable grid ----------
+    st.markdown("### Edit / Append in grid")
+    st.caption("Add new rows at the bottom. Click **Save grid changes** to validate & apply filters/dedup.")
+
+    # Ensure consistent column order & types
+    base_cols = ["Company", "Email", "Website", "Phone", "Source"]
+    df_now = st.session_state.leads.copy()
+    for c in base_cols:
+        if c not in df_now.columns:
+            df_now[c] = ""
+
+    edited = st.data_editor(
+        df_now[base_cols],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="leads_editor",
+    )
+
+    if st.button("Save grid changes"):
+        # Validate and rebuild dataset from editor
+        added = 0
+        kept = 0
+        skipped_invalid = 0
+        skipped_generic = 0
+        skipped_mx = 0
+        deduped = 0
+
+        cleaned_rows = []
+        seen = set()
+
+        for _, row in edited.iterrows():
+            company = (str(row.get("Company", "") or "")).strip()[:120]
+            email = (str(row.get("Email", "") or "")).strip()
+            website = (str(row.get("Website", "") or "")).strip()
+            phone = (str(row.get("Phone", "") or "")).strip()
+            source = (str(row.get("Source", "") or "manual")).strip() or "manual"
+
+            if not email or not EMAIL_RE.match(email):
+                skipped_invalid += 1
+                continue
+            if st.session_state.get("skip_generic") and is_generic_email(email):
+                skipped_generic += 1
+                continue
+            if st.session_state.get("verify_mx") and not verify_email_mx(email):
+                skipped_mx += 1
+                continue
+            if email.lower() in seen:
+                deduped += 1
+                continue
+
+            cleaned_rows.append(
+                {"Company": company, "Email": email, "Website": website, "Phone": phone, "Source": source}
+            )
+            seen.add(email.lower())
+
+        prev_count = len(st.session_state.leads)
+        st.session_state.leads = pd.DataFrame(cleaned_rows, columns=base_cols)
+        kept = len(st.session_state.leads)
+        added = max(0, kept - min(prev_count, kept))
+
+        st.success(f"Saved grid. Total kept: {kept}.")
+        if skipped_invalid:
+            st.info(f"Skipped {skipped_invalid} invalid email row(s).")
+        if skipped_generic:
+            st.info(f"Skipped {skipped_generic} generic inbox row(s). (See sidebar)")
+        if skipped_mx:
+            st.info(f"Skipped {skipped_mx} MX-missing row(s). (See sidebar)")
+        if deduped:
+            st.info(f"Removed {deduped} duplicate email row(s) within the grid.")
+
+    st.markdown("---")
+
+    # ---------- Current table ----------
     df = st.session_state.leads.copy()
     if df.empty:
-        st.info("No leads yet. Run a search first.")
+        st.info("No leads yet. Add manually above or run a search in the **Search** tab.")
     else:
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.caption(f"Total leads: {len(df)}")
 
+        c1, c2 = st.columns(2)
+        with c1:
+            emails_to_remove = st.text_input("Emails to remove (comma-separated)", key="remove_box")
+            if st.button("Remove selected"):
+                emails_rm = {e.strip().lower() for e in emails_to_remove.split(",") if e.strip()}
+                before = len(st.session_state.leads)
+                st.session_state.leads = st.session_state.leads[~st.session_state.leads["Email"].str.lower().isin(emails_rm)]
+                after = len(st.session_state.leads)
+                st.success(f"Removed {before - after} lead(s).")
+        with c2:
+            if st.button("Clear ALL leads"):
+                st.session_state.leads = st.session_state.leads.iloc[0:0]
+                st.warning("All leads cleared.")
+
+# ====================== EMAIL TAB ======================
 with tab_email:
     st.subheader("Email campaign (Gmail)")
     st.caption(
@@ -514,7 +718,6 @@ with tab_email:
             if not GMAIL_APP_PASSWORD:
                 st.error("GMAIL_APP_PASSWORD not set in Secrets.")
             else:
-                # quick auth probe without sending
                 context = ssl.create_default_context()
                 with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
                     server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
@@ -552,6 +755,7 @@ with tab_email:
                     continue
             st.success(f"Sent {sent} emails via Gmail.")
 
+# ====================== EXPORT / IMPORT TAB ======================
 with tab_export:
     st.subheader("Export / Import")
     df = st.session_state.leads.copy()
